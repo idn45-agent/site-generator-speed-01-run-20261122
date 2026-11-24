@@ -93,14 +93,21 @@ function isSpaceCode(code) {
   );
 }
 
+/** Whitespace lookup by code unit, built once from isSpaceCode: a table hit beats a call per character. */
+const SPACE_TABLE = (() => {
+  const t = new Uint8Array(65536);
+  for (let i = 0; i < 65536; i++) if (isSpaceCode(i)) t[i] = 1;
+  return t;
+})();
+
 /** The number of words in `text`: its runs of characters other than whitespace. */
 function countWords(text) {
   let n = 0;
-  let inWord = false;
+  let inWord = 0;
   for (let i = 0; i < text.length; i++) {
-    if (isSpaceCode(text.charCodeAt(i))) inWord = false;
+    if (SPACE_TABLE[text.charCodeAt(i)]) inWord = 0;
     else if (!inWord) {
-      inWord = true;
+      inWord = 1;
       n++;
     }
   }
@@ -190,19 +197,34 @@ function fmValueOf(key, raw) {
  * refused. `text` has "\n" line ends.
  */
 function parseFrontMatter(text) {
-  const lines = text.split('\n');
-  if (lines[0] !== '---') return { error: 'no front matter' };
-  let close = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i] === '---') {
-      close = i;
-      break;
+  // Locate the closing fence by scanning line starts, without splitting the whole document:
+  // the body is usually hundreds of lines and splitting/joining it again was pure allocation.
+  if (text !== '---' && !text.startsWith('---\n')) return { error: 'no front matter' };
+  let closeStart = -1; // offset where the closing '---' line starts
+  let closeEnd = -1; // offset of the '\n' ending that line (or text.length)
+  let close = -1; // its line index
+  {
+    let pos = 4;
+    let idx = 1;
+    while (pos <= text.length) {
+      const nl = text.indexOf('\n', pos);
+      const end = nl === -1 ? text.length : nl;
+      if (end - pos === 3 && text.startsWith('---', pos)) {
+        closeStart = pos;
+        closeEnd = end;
+        close = idx;
+        break;
+      }
+      if (nl === -1) break;
+      pos = nl + 1;
+      idx++;
     }
   }
   if (close === -1) return { error: 'the front matter is not closed' };
+  const lines = closeStart === 4 ? [] : text.slice(4, closeStart - 1).split('\n');
   const data = {};
   for (let i = 1; i < close; i++) {
-    const line = lines[i];
+    const line = lines[i - 1];
     if (BLANK_LINE.test(line) || line.charCodeAt(0) === 35) continue;
     const m = FM_LINE.exec(line);
     if (!m) return { error: `line ${i + 1} is not "key: value"` };
@@ -216,7 +238,7 @@ function parseFrontMatter(text) {
     data[key] = v.value;
   }
   if (!hasOwn.call(data, 'title')) return { error: 'no title' };
-  return { data, body: lines.slice(close + 1).join('\n') };
+  return { data, body: closeEnd === text.length ? '' : text.slice(closeEnd + 1) };
 }
 
 // ---------------------------------------------------------------- markdown
@@ -229,14 +251,74 @@ const MD_HR = /^(?:---|\*\*\*)[ \t]*$/;
 const MD_BULLET = /^[-*] (.*)$/;
 const MD_ORDERED = /^(\d{1,9})\. (.*)$/;
 const MD_CONTINUED = /^ {2,}\S/;
-const TRIM_LINE = /^[ \t]+|[ \t]+$/g;
+/** `line` with leading and trailing spaces/tabs removed: a manual scan, far cheaper than a regex replace. */
+function trimLine(line) {
+  let a = 0;
+  let b = line.length;
+  while (a < b) {
+    const c = line.charCodeAt(a);
+    if (c !== 32 && c !== 9) break;
+    a++;
+  }
+  while (b > a) {
+    const c = line.charCodeAt(b - 1);
+    if (c !== 32 && c !== 9) break;
+    b--;
+  }
+  return a === 0 && b === line.length ? line : line.slice(a, b);
+}
 
-const trimLine = (line) => line.replace(TRIM_LINE, '');
-
-/** A heading line's level and text, or null (a heading's text is never empty). */
+/** A heading line's level and text, or null (a heading's text is never empty). Manual equivalent of MD_HEADING. */
 function headingOf(line) {
-  const m = MD_HEADING.exec(line);
-  return m === null || m[2] === '' ? null : { depth: m[1].length, text: m[2] };
+  let depth = 0;
+  while (depth < line.length && line.charCodeAt(depth) === 35) depth++;
+  if (depth === 0 || depth > 6) return null;
+  let a = depth;
+  if (a >= line.length || (line.charCodeAt(a) !== 32 && line.charCodeAt(a) !== 9)) return null;
+  while (a < line.length && (line.charCodeAt(a) === 32 || line.charCodeAt(a) === 9)) a++;
+  let b = line.length;
+  while (b > a && (line.charCodeAt(b - 1) === 32 || line.charCodeAt(b - 1) === 9)) b--;
+  return b <= a ? null : { depth, text: line.slice(a, b) };
+}
+
+/** Whether `line` is a thematic break: exactly --- or *** plus trailing spaces/tabs. */
+function isHr(line) {
+  if (line.length < 3) return false;
+  const c = line.charCodeAt(0);
+  if (line.charCodeAt(1) !== c || line.charCodeAt(2) !== c) return false;
+  for (let i = 3; i < line.length; i++) {
+    const k = line.charCodeAt(i);
+    if (k !== 32 && k !== 9) return false;
+  }
+  return true;
+}
+
+/** A fence-open line's language, or null: ``` then [A-Za-z0-9_+-]* then spaces/tabs. */
+function fenceLang(line) {
+  if (!line.startsWith('```')) return null;
+  let i = 3;
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    const ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45;
+    if (!ok) break;
+    i++;
+  }
+  const lang = line.slice(3, i);
+  for (; i < line.length; i++) {
+    const k = line.charCodeAt(i);
+    if (k !== 32 && k !== 9) return null;
+  }
+  return lang;
+}
+
+/** Whether `line` closes a fence: ``` plus spaces/tabs only. */
+function isFenceClose(line) {
+  if (!line.startsWith('```')) return false;
+  for (let i = 3; i < line.length; i++) {
+    const k = line.charCodeAt(i);
+    if (k !== 32 && k !== 9) return false;
+  }
+  return true;
 }
 
 /**
@@ -248,9 +330,9 @@ function endsParagraph(line) {
   if (line === '') return true;
   const c = line.charCodeAt(0);
   if (c === 32 || c === 9) return MD_BLANK.test(line);
-  if (c === 96) return MD_FENCE_OPEN.test(line);
+  if (c === 96) return fenceLang(line) !== null;
   if (c === 35) return headingOf(line) !== null;
-  if (c === 45 || c === 42) return MD_HR.test(line);
+  if (c === 45 || c === 42) return isHr(line);
   return false;
 }
 
@@ -292,7 +374,12 @@ function findSingleStar(s, from) {
  * `s` rendered inline; `env.link(target)` is a link's href. Plain runs are escaped in bulk
  * between the special characters (\ ` * [) instead of character by character.
  */
+const INLINE_SPECIAL = /[\\`*[]/;
+
 function inline(s, env) {
+  // Most fragments hold no inline markup at all: one regex scan settles those, instead of the
+  // four indexOf probes per plain run in the general loop below.
+  if (!INLINE_SPECIAL.test(s)) return escapeHtml(s);
   let out = '';
   let i = 0;
   let plainStart = 0;
@@ -391,16 +478,15 @@ function renderMarkdown(src, env, slugify) {
       continue;
     }
     const first = line.charCodeAt(0);
-    const fence = first === 96 ? MD_FENCE_OPEN.exec(line) : null;
-    if (fence !== null) {
+    const flang = first === 96 ? fenceLang(line) : null;
+    if (flang !== null) {
       i++;
-      let body = '';
-      while (i < lines.length && !MD_FENCE_CLOSE.test(lines[i])) {
-        body += `${escapeHtml(lines[i])}\n`;
-        i++;
-      }
+      const bodyStart = i;
+      while (i < lines.length && !isFenceClose(lines[i])) i++;
+      // One escape over the joined block (\n is never escaped) instead of one call per line.
+      const body = i > bodyStart ? `${escapeHtml(lines.slice(bodyStart, i).join('\n'))}\n` : '';
       i++;
-      const cls = fence[1] === '' ? '' : ` class="language-${escapeHtml(fence[1])}"`;
+      const cls = flang === '' ? '' : ` class="language-${escapeHtml(flang)}"`;
       html += `<pre><code${cls}>${body}</code></pre>\n`;
       continue;
     }
@@ -413,7 +499,7 @@ function renderMarkdown(src, env, slugify) {
       i++;
       continue;
     }
-    if ((first === 45 || first === 42) && MD_HR.test(line)) {
+    if ((first === 45 || first === 42) && isHr(line)) {
       html += '<hr>\n';
       i++;
       continue;
@@ -421,15 +507,19 @@ function renderMarkdown(src, env, slugify) {
     if (line.charCodeAt(0) === 62) {
       const kept = [];
       while (i < lines.length && lines[i].charCodeAt(0) === 62) {
-        const t = trimLine(lines[i].replace(/^> ?/, ''));
+        // /^> ?/ by hand: the '>' itself, then at most one space.
+        let rest = lines[i].slice(1);
+        if (rest.charCodeAt(0) === 32) rest = rest.slice(1);
+        const t = trimLine(rest);
         if (t !== '') kept.push(t);
         i++;
       }
       html += kept.length === 0 ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(kept.join('\n'), env)}</p>\n</blockquote>\n`;
       continue;
     }
-    const bullet = MD_BULLET.exec(line);
-    const ordered = bullet === null ? MD_ORDERED.exec(line) : null;
+    // A list item can only open on '-', '*' or a digit, so only run the regexes there.
+    const bullet = first === 45 || first === 42 ? MD_BULLET.exec(line) : null;
+    const ordered = bullet === null && first >= 48 && first <= 57 ? MD_ORDERED.exec(line) : null;
     if (bullet !== null || ordered !== null) {
       const isOrdered = ordered !== null;
       const marker = isOrdered ? MD_ORDERED : MD_BULLET;
@@ -894,16 +984,22 @@ export function run(input) {
           date: s.data.date ?? '',
           date_long: s.data.date === undefined ? '' : longDate(s.data.date),
         };
-  const cardOf = (s) => ({
-    title: s.data.title,
-    url: s.url,
-    date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(s.data.date),
-    summary: s.data.summary ?? '',
-    excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(countWords(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
-  });
+  const cardOf = (s) => {
+    // The word count scans the whole body, so compute it once per source and reuse the card:
+    // a post's card is wanted for the collections and again for its own page.
+    if (s.card !== undefined) return s.card;
+    s.card = {
+      title: s.data.title,
+      url: s.url,
+      date: s.data.date ?? '',
+      date_long: s.data.date === undefined ? '' : longDate(s.data.date),
+      summary: s.data.summary ?? '',
+      excerpt: s.excerpt,
+      reading_minutes: Math.max(1, Math.ceil(countWords(s.body) / 200)),
+      tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+    };
+    return s.card;
+  };
 
   // Layouts: every page through its layout, then the index, tag and tags pages, then the statics.
   const output = {};
@@ -920,7 +1016,7 @@ export function run(input) {
       ...cardOf(s),
       slug: s.slug,
       content: s.html,
-      toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+      toc: s.toc,
       newer: linkOf(s.newer ?? null),
       older: linkOf(s.older ?? null),
       is_post: s.post,
